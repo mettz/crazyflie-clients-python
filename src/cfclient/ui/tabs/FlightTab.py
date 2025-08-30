@@ -31,6 +31,9 @@ The flight control tab shows telemetry data and flight settings.
 
 import logging
 from enum import Enum
+import struct
+import time
+import threading
 
 from PyQt6 import uic
 from PyQt6.QtCore import Qt, pyqtSignal
@@ -40,6 +43,8 @@ import cfclient
 from cfclient.ui.widgets.ai import AttitudeIndicator
 
 from cflib.crazyflie.log import LogConfig
+from cflib.crtp.crtpstack import CRTPPacket, CRTPPort
+from cflib.crazyflie.commander import META_COMMAND_CHANNEL
 
 from cfclient.utils.config import Config
 from cfclient.utils.input import JoystickReader
@@ -85,6 +90,7 @@ class CommanderAction(Enum):
     RIGHT = 6
     FORWARD = 7
     BACK = 8
+    CUSTOM = 9
 
 
 class FlightTab(TabToolbox, flight_tab_class):
@@ -186,7 +192,11 @@ class FlightTab(TabToolbox, flight_tab_class):
         self.commanderBackButton.clicked.connect(lambda: self._flight_command(CommanderAction.BACK))
         self.commanderUpButton.clicked.connect(lambda: self._flight_command(CommanderAction.UP))
         self.commanderDownButton.clicked.connect(lambda: self._flight_command(CommanderAction.DOWN))
+        self.commanderCustomButton.clicked.connect(lambda: self._flight_command(CommanderAction.CUSTOM))
         self._update_flight_commander(False)
+
+        self._custom_thread = None
+        self._custom_stop_event = threading.Event()
 
         # Supervisor
         self._supervisor_info_bitfield = 0
@@ -278,6 +288,48 @@ class FlightTab(TabToolbox, flight_tab_class):
             self._helper.cf.high_level_commander.go_to(0, 0, move_dist, 0, move_dist / move_vel, relative=True)
         elif action == CommanderAction.DOWN:
             self._helper.cf.high_level_commander.go_to(0, 0, -move_dist, 0, move_dist / move_vel, relative=True)
+        elif action == CommanderAction.CUSTOM:
+            if self._custom_thread and self._custom_thread.is_alive():
+                # Stop thread
+                logger.info("Stopping CUSTOM thread (toggle off)")
+                self._custom_stop_event.set()
+                self._custom_thread.join()
+                self._custom_thread = None
+                self.commanderCustomButton.setText("Start")
+            else:
+                # Start thread
+                logger.info("Starting CUSTOM thread (toggle on)")
+                self._custom_stop_event.clear()
+                self._custom_thread = threading.Thread(target=self._custom_loop, daemon=True)
+                self._custom_thread.start()
+                self.commanderCustomButton.setText("Stop")
+        
+    
+    def _custom_loop(self):
+        prev = time.time()
+        acc = 0
+        cnt = 0
+        while not self._custom_stop_event.is_set():
+            current = time.time()
+            acc += current - prev
+            cnt += 1
+
+            if cnt % 100 == 0:
+                logger.info(f"Average rate: {1/(acc / cnt):.3f}Hz")
+                acc = 0
+                cnt = 0
+
+            prev = current
+
+            pk = CRTPPacket()
+            pk.port = CRTPPort.COMMANDER_GENERIC
+            pk.channel = META_COMMAND_CHANNEL
+            pk.data = struct.pack('<B', 1)
+            self._helper.cf.send_packet(pk)
+
+            time.sleep(0.001)
+
+        logger.info("CUSTOM thread stopped")
 
     def _logging_error(self, log_conf, msg):
         QMessageBox.about(self, "Log error",
